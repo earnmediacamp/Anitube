@@ -1,23 +1,71 @@
-name: Build APK
+name: Build and Release APK
+
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
+    inputs:
+      version:
+        description: "Version name (jaise 1.2)"
+        required: true
+      notes:
+        description: "Changelog (chhota sa)"
+        required: false
+        default: "Bug fixes"
+
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: unzip -q AniTube.zip
+
+      - name: Source zip kholo
+        run: |
+          unzip -q source.zip -d src_tmp
+          DIR=$(dirname "$(find src_tmp -maxdepth 3 -name settings.gradle.kts | head -1)")
+          echo "PROJ=$DIR" >> "$GITHUB_ENV"
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: "17"
+
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.7
-      - run: cd AniTube && gradle assembleRelease --no-daemon
-      - uses: actions/upload-artifact@v4
-        with:
-          name: AniTube-apk
-          path: AniTube/app/build/outputs/apk/release/*.apk
+          gradle-version: "8.7"
+
+      - name: Signing key lagao
+        env:
+          KS_B64: ${{ secrets.KS_B64 }}
+          KS_PASS: ${{ secrets.KS_PASS }}
+        run: |
+          echo "$KS_B64" | base64 -d > "$PROJ/anitube-release.jks"
+          printf 'storeFile=anitube-release.jks\nstorePassword=%s\nkeyAlias=anitube\nkeyPassword=%s\n' "$KS_PASS" "$KS_PASS" > "$PROJ/keystore.properties"
+
+      - name: APK build
+        env:
+          VER: ${{ inputs.version }}
+        working-directory: ${{ env.PROJ }}
+        run: gradle assembleRelease --no-daemon -PverCode=$((GITHUB_RUN_NUMBER + 10)) -PverName="$VER"
+
+      - name: version.json banao
+        env:
+          VER: ${{ inputs.version }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          cp "$PROJ/app/build/outputs/apk/release/app-release.apk" "AniTube-$VER.apk"
+          SHA=$(sha256sum "AniTube-$VER.apk" | cut -d' ' -f1)
+          jq -n --argjson code $((GITHUB_RUN_NUMBER + 10)) --arg name "$VER" \
+            --arg url "https://github.com/${{ github.repository }}/releases/download/v$VER/AniTube-$VER.apk" \
+            --arg sha "$SHA" --arg log "$NOTES" \
+            '{versionCode:$code, versionName:$name, apkUrl:$url, sha256:$sha, changelog:$log}' > version.json
+          cat version.json
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VER: ${{ inputs.version }}
+          NOTES: ${{ inputs.notes }}
+        run: gh release create "v$VER" "AniTube-$VER.apk" version.json --title "AniTube v$VER" --notes "$NOTES" --latest
+        
