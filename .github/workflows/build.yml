@@ -49,17 +49,57 @@ jobs:
         working-directory: ${{ env.PROJ }}
         run: gradle assembleRelease --no-daemon -PverCode=$((GITHUB_RUN_NUMBER + 10)) -PverName="$VER"
 
+      - name: APK file taiyar karo
+        env:
+          VER: ${{ inputs.version }}
+        run: cp "$PROJ/app/build/outputs/apk/release/app-release.apk" "AniTube-$VER.apk"
+
+      # Pichle release se naye APK ka chhota patch. Fail ho (ya pehla release ho) to bhi release chalta hai, bas poora APK jayega.
+      - name: Patch banao (pichle release se)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VER: ${{ inputs.version }}
+        run: |
+          set -e
+          sudo apt-get install -y bsdiff > /dev/null
+          PREV=$(gh release view --json tagName -q .tagName)
+          mkdir prev
+          gh release download "$PREV" --dir prev --pattern 'AniTube-*.apk' --pattern 'version.json'
+          OLD=$(ls prev/AniTube-*.apk | head -1)
+          PCODE=$(jq -r .versionCode prev/version.json)
+          bsdiff "$OLD" "AniTube-$VER.apk" raw.bsdiff
+          PF="AniTube-$PCODE-to-$VER.patch"
+          python3 "$PROJ/tools/pack-patch.py" raw.bsdiff "$PF"
+          APK_SIZE=$(stat -c%s "AniTube-$VER.apk")
+          PATCH_SIZE=$(stat -c%s "$PF")
+          if [ $((PATCH_SIZE * 10)) -gt $((APK_SIZE * 8)) ]; then
+            echo "Patch bada hai ($PATCH_SIZE / $APK_SIZE), skip"
+            rm -f "$PF"
+          else
+            echo "PATCH_FILE=$PF" >> "$GITHUB_ENV"
+            echo "PATCH_FROM=$PCODE" >> "$GITHUB_ENV"
+          fi
+
       - name: version.json banao
         env:
           VER: ${{ inputs.version }}
           NOTES: ${{ inputs.notes }}
         run: |
-          cp "$PROJ/app/build/outputs/apk/release/app-release.apk" "AniTube-$VER.apk"
           SHA=$(sha256sum "AniTube-$VER.apk" | cut -d' ' -f1)
+          SIZE=$(stat -c%s "AniTube-$VER.apk")
+          BASE="https://github.com/${{ github.repository }}/releases/download/v$VER"
           jq -n --argjson code $((GITHUB_RUN_NUMBER + 10)) --arg name "$VER" \
-            --arg url "https://github.com/${{ github.repository }}/releases/download/v$VER/AniTube-$VER.apk" \
-            --arg sha "$SHA" --arg log "$NOTES" \
-            '{versionCode:$code, versionName:$name, apkUrl:$url, sha256:$sha, changelog:$log}' > version.json
+            --arg url "$BASE/AniTube-$VER.apk" \
+            --arg sha "$SHA" --argjson size "$SIZE" --arg log "$NOTES" \
+            '{versionCode:$code, versionName:$name, apkUrl:$url, sha256:$sha, sizeBytes:$size, changelog:$log}' > version.json
+          if [ -n "${PATCH_FILE:-}" ] && [ -f "$PATCH_FILE" ]; then
+            PSHA=$(sha256sum "$PATCH_FILE" | cut -d' ' -f1)
+            PSIZE=$(stat -c%s "$PATCH_FILE")
+            jq --arg url "$BASE/$PATCH_FILE" --argjson from "$PATCH_FROM" --argjson size "$PSIZE" --arg sha "$PSHA" \
+              '. + {patch:{url:$url, fromCode:$from, sizeBytes:$size, sha256:$sha}}' version.json > version.tmp
+            mv version.tmp version.json
+          fi
           cat version.json
 
       - name: GitHub Release
@@ -67,5 +107,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VER: ${{ inputs.version }}
           NOTES: ${{ inputs.notes }}
-        run: gh release create "v$VER" "AniTube-$VER.apk" version.json --title "AniTube v$VER" --notes "$NOTES" --latest
-        
+        run: |
+          ASSETS=("AniTube-$VER.apk" version.json)
+          if [ -n "${PATCH_FILE:-}" ] && [ -f "$PATCH_FILE" ]; then ASSETS+=("$PATCH_FILE"); fi
+          gh release create "v$VER" "${ASSETS[@]}" --title "AniTube v$VER" --notes "$NOTES" --latest
